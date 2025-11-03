@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "array": "cpp",
+        "iterator": "cpp",
+        "memory": "cpp",
+        "mutex": "cpp",
+        "utility": "cpp",
+        "vector": "cpp"
+    }
+}
