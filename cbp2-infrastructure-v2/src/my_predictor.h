@@ -10,7 +10,7 @@ public:
 	// base table index used
 	unsigned int base_index;
 	// indices looked up in tagged tables
-	unsigned int idx[4];
+	unsigned int idx[14];
 	// which table provided the prediction (-1 means base)
 	int provider;
 	// which table provided the alternate prediction (-1 means none/base)
@@ -21,74 +21,110 @@ public:
 
 class my_predictor : public branch_predictor {
 public:
-// Parameters for small TAGE configuration (fits in 32kb)
-#define MAX_HIST	64
-#define BASE_BITS	14			// 16K-entry bimodal
-#define NTABLES		4			// number of tagged tables
-#define TBL_BITS	10			// 1K entries per tagged table
-#define TAG_BITS	8			// 8-bit tags
+// Preset A: L-TAGE heavy (~1MB). 64K-entry base + 14 tagged tables with geometric histories up to ~800.
+#define HLEN		1024			// number of history bits kept (power of two for fast wrap)
+#define BASE_BITS	16			// 64K-entry bimodal (byte per entry here)
+#define NTABLES		14			// number of tagged tables
 
 	my_update u;
 	branch_info bi;
-	unsigned long long ghist; // 64-bit global history of conditional branches
+	// Circular bit history to support long histories (up to HLEN bits)
+	unsigned int hpos; // next write position [0..HLEN-1]
+	unsigned int hbits[HLEN/32]; // bit buffer storing taken/not-taken
 
 	// Base predictor: 2-bit counters [0..3]
 	unsigned char base[1 << BASE_BITS];
 
-	unsigned short tags[NTABLES][1 << TBL_BITS]; // TAG_BITS used
-	unsigned char  ctrs[NTABLES][1 << TBL_BITS]; // 2-bit saturating counters
-	unsigned char  us[NTABLES][1 << TBL_BITS];   // 2-bit usefulness counters
+	// Tagged tables: per-bank arrays with variable sizes
+	unsigned short *tags[NTABLES];
+	signed char  *ctrs[NTABLES];   // 3-bit signed counters in [-4..+3]
+	unsigned char *us[NTABLES];    // 2-bit usefulness counters stored in a byte (0..3)
 
-	// Per-table history lengths (geometric)
-	unsigned int hist_len[NTABLES];
+	// Per-table parameters
+	unsigned int hist_len[NTABLES];   // history lengths
+	unsigned char tbl_bits[NTABLES];  // log2(entries) per table
+	unsigned int tbl_size[NTABLES];   // entries per table
+	unsigned char tag_bits[NTABLES];  // tag width per table (<=15)
+	unsigned int salts[NTABLES];      // per-table salts for hashing
 
 	// Simple aging counter for usefulness
 	unsigned int tick;
 
-	my_predictor (void) : ghist(0), tick(0) {
-		// Choose geometric history lengths within 64-bit window
-		hist_len[0] = 5; // T1 uses 5 history bits
-		hist_len[1] = 10; // T2 uses 10 history bits
-		hist_len[2] = 20; // T3 uses 20 history bits
-		hist_len[3] = 40; // T4 uses 40 history bits
+	my_predictor (void) : hpos(0), tick(0) {
+		// Initialize history buffer
+		memset(hbits, 0, sizeof(hbits));
+		// Configure per-table sizes, tags, and history lengths.
+		// Short 6 banks: 8K entries, tags 10 bits
+		// Mid 6 banks: 16K entries, tags 12–13 bits
+		// Long 2 banks: 32K entries, tags 14–15 bits
+		const unsigned short HL[NTABLES] = { 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 800 };
+		const unsigned char TB[NTABLES] = { 13,13,13,13,13,13, 14,14,14,14,14,14, 15,15 };
+		const unsigned char TG[NTABLES] = { 10,10,10,10,10,10, 12,12,12,13,13,13, 14,15 };
+		for (int t = 0; t < NTABLES; ++t) {
+			hist_len[t] = HL[t];
+			tbl_bits[t] = TB[t];
+			tbl_size[t] = 1U << tbl_bits[t];
+			tag_bits[t] = TG[t];
+			// Simple distinct salts derived from table index
+			salts[t] = 0x9E3779B9u * (t + 1) ^ (0x85EBCA6Bu + (t << 16));
+		}
+
 		memset(base, 1, sizeof(base));	// initialize T0 to weakly not taken
-		memset(tags, 0, sizeof(tags));	// initialize tags to 0
-		memset(ctrs, 1, sizeof(ctrs));	// initialize counters to weakly not taken
-		memset(us,   0, sizeof(us));	// initialize usefulness to 0
+		// allocate and init tagged banks
+		for (int t = 0; t < NTABLES; ++t) {
+			tags[t] = new unsigned short[tbl_size[t]];
+			ctrs[t] = new signed char[tbl_size[t]];
+			us[t]   = new unsigned char[tbl_size[t]];
+			memset(tags[t], 0, sizeof(unsigned short) * tbl_size[t]);
+			// 3-bit signed counters start at -1 (weakly not-taken)
+			for (unsigned int i = 0; i < tbl_size[t]; ++i) ctrs[t][i] = -1;
+			memset(us[t],   0, sizeof(unsigned char) * tbl_size[t]);
+		}
 	}
 
-	inline unsigned int mask_bits(unsigned int n) {
-		return (1U << n) - 1U;
+	inline unsigned int mask_bits(unsigned int n) { return (1U << n) - 1U; }
+	static inline unsigned int rotl32(unsigned int x, unsigned int r) { return (x << (r & 31)) | (x >> ((32 - r) & 31)); }
+
+	inline unsigned int get_hist_bit(unsigned int back) const {
+		unsigned int pos = (hpos + HLEN - 1 - (back & (HLEN - 1))) & (HLEN - 1);
+		unsigned int idx = pos >> 5; // /32
+		unsigned int ofs = pos & 31; // %32
+		return (hbits[idx] >> ofs) & 1U;
 	}
 
-	inline unsigned int idx_calc(int t, unsigned int pc) {	// Fold the lower hist_len[t] bits of history into an index
-		// mask for table size
-		unsigned int m = mask_bits(TBL_BITS);
-		// keep global history bits used in the table
-		unsigned long long h = ghist & ((hist_len[t] == 64) ? ~0ULL : ((1ULL << hist_len[t]) - 1ULL));
-		// Mix history bits
-		unsigned long long mix = h ^ (h >> (hist_len[t] ? (hist_len[t] / 2) : 1)) ^ (h * 0x9E3779B97F4A7C15ULL);
-		// Combine with PC bits and fold down to 32 bits
-		unsigned int x = (unsigned int)(mix) ^ (unsigned int)(mix >> 32) ^ pc ^ (pc >> TBL_BITS);
-		// reduce to table size
-		return x & m;
+	inline unsigned int fold_history(unsigned int L) const {
+		unsigned int v = 0xA5A5A5A5u;
+		unsigned int step = 1; // no stride (can tweak)
+		for (unsigned int i = 0; i < L; i += step) {
+			v = rotl32(v, 1) ^ get_hist_bit(i);
+		}
+		return v;
 	}
 
-	inline unsigned short tag_calc(int t, unsigned int pc) {	// Mix PC and history; keep TAG_BITS
-		// mask for table size
-		unsigned long long h = ghist & ((hist_len[t] == 64) ? ~0ULL : ((1ULL << hist_len[t]) - 1ULL));
-		// Mix history bits with a different constant
-		unsigned long long mix = (h ^ (h >> (t + 1)) ^ (h * 0xC6A4A7935BD1E995ULL) ^ ((unsigned long long)pc << 32) ^ pc);
-		// Fold down to 32 bits
-		unsigned int x = (unsigned int)(mix ^ (mix >> 16));
-		// return tag bits
-		return (unsigned short)(x & ((1U << TAG_BITS) - 1U));
+	inline unsigned int idx_calc(int t, unsigned int pc) {
+		unsigned int hfold = fold_history(hist_len[t]);
+		unsigned int x = pc ^ rotl32(pc, t + 1) ^ hfold ^ salts[t];
+		return x & mask_bits(tbl_bits[t]);
 	}
 
-	inline bool ctr_pred(unsigned char c) { return c >= 2; }
-	inline void ctr_inc(unsigned char &c) { if (c < 3) ++c; }
-	inline void ctr_dec(unsigned char &c) { if (c > 0) --c; }
-	inline bool ctr_weak(unsigned char c) { return c == 1 || c == 2; }
+	inline unsigned short tag_calc(int t, unsigned int pc) {
+		unsigned int hfold = fold_history(hist_len[t] ^ (t * 7));
+		unsigned int x = (pc ^ (pc >> 7) ^ rotl32(pc, 13 + t) ^ hfold ^ (salts[t] * 0x27D4EB2Du));
+		return (unsigned short)(x & mask_bits(tag_bits[t]));
+	}
+
+	// Base bimodal (2-bit) helpers
+	inline bool bctr_pred(unsigned char c) { return c >= 2; }
+	inline void bctr_inc(unsigned char &c) { if (c < 3) ++c; }
+	inline void bctr_dec(unsigned char &c) { if (c > 0) --c; }
+	inline bool bctr_weak(unsigned char c) { return c == 1 || c == 2; }
+
+	// Tagged (3-bit signed) helpers: range [-4..+3], taken if >= 0
+	inline bool tctr_pred(signed char c) { return c >= 0; }
+	inline void tctr_train(signed char &c, bool taken) {
+		if (taken) { if (c < 3) ++c; }
+		else { if (c > -4) --c; }
+	}
 
 	branch_update *predict (branch_info & b) {
 		bi = b;
@@ -99,33 +135,33 @@ public:
 		if (b.br_flags & BR_CONDITIONAL) {
 			// Base predictor
 			u.base_index = b.address & mask_bits(BASE_BITS);
-			bool base_pred = ctr_pred(base[u.base_index]);
+			bool base_pred = bctr_pred(base[u.base_index]);
 
 			// Probe tagged tables
 			int provider = -1;	// base by default
 			int alt_provider = -1;	// also base by default
-			unsigned char provider_ctr = 0;
+			signed char provider_ctr = -1;
 			bool alt_pred = base_pred;
 			for (int t = NTABLES - 1; t >= 0; --t) {	// start from table w/ longest history
-				unsigned int idx = idx_calc(t, b.address);	// calculate index for table
+				unsigned int idx = idx_calc(t, b.address);
 				u.idx[t] = idx;
-				unsigned short tg = tag_calc(t, b.address);	// calculate tag for table
-				if (tags[t][idx] == tg) {	// update provider if tag match
+				unsigned short tg = tag_calc(t, b.address);
+				if (tags[t][idx] == tg) {
 					if (provider < 0) {
 						provider = t;
 						provider_ctr = ctrs[t][idx];
 					} else if (alt_provider < 0) {
 						alt_provider = t;
-						alt_pred = ctr_pred(ctrs[t][idx]);
+						alt_pred = tctr_pred(ctrs[t][idx]);
 					}
 				}
 			}
 
 			bool final_pred = base_pred;
 			if (provider >= 0) {
-				bool ppred = ctr_pred(provider_ctr);
+				bool ppred = tctr_pred(provider_ctr);
 				// Use alternate if provider is weak and alternate exists and differs
-				if (ctr_weak(provider_ctr) && alt_provider >= 0) {
+				if ((provider_ctr == -1 || provider_ctr == 0) && alt_provider >= 0) {
 					final_pred = alt_pred;
 					u.used_alt = (final_pred != ppred);
 				} else {
@@ -151,29 +187,29 @@ public:
 			// cast back into my_update to access fields
 			my_update *mu = (my_update*)u_in;
 			// Always increment base predictor if taken
-			if (taken) ctr_inc(base[mu->base_index]);
+			if (taken) bctr_inc(base[mu->base_index]);
 			// Always decrement base predictor if not taken
-			else ctr_dec(base[mu->base_index]);
+			else bctr_dec(base[mu->base_index]);
 
 			// Provider/alternate update context
 			int provider = mu->provider;
 			int alt_provider = mu->alt_provider;
 			bool provider_pred = false;
 			bool alt_pred = false;
-			unsigned char *pctr = 0;
-			unsigned char *actr = 0;
+			signed char *pctr = 0;
+			signed char *actr = 0;
 			if (alt_provider >= 0) {
 				actr = &ctrs[alt_provider][mu->idx[alt_provider]];
-				alt_pred = ctr_pred(*actr);
+				alt_pred = tctr_pred(*actr);
 			}
 			if (provider >= 0) {
 				// update provider counter
 				pctr = &ctrs[provider][mu->idx[provider]];
-				provider_pred = ctr_pred(*pctr);
-				if (taken) ctr_inc(*pctr); else ctr_dec(*pctr);
+				provider_pred = tctr_pred(*pctr);
+				tctr_train(*pctr, taken);
 				// If we used the alternate, also train its counter toward the outcome
 				if (mu->used_alt && alt_provider >= 0 && actr) {
-					if (taken) ctr_inc(*actr); else ctr_dec(*actr);
+					tctr_train(*actr, taken);
 				}
 				// Update usefulness if alternate disagreed (i.e., when used)
 				unsigned char &pu = us[provider][mu->idx[provider]];
@@ -192,7 +228,7 @@ public:
 			// Concretely: if provider exists and is wrong, allocate unless we used a correct alternate.
 			// If no provider, allocate only when base was wrong.
 			bool provider_wrong = (provider >= 0) ? (provider_pred != taken) : false;
-			bool base_pred = ctr_pred(base[mu->base_index]);
+			bool base_pred = bctr_pred(base[mu->base_index]);
 			bool should_alloc = false;
 			if (provider >= 0) {
 				if (provider_wrong) {
@@ -216,7 +252,7 @@ public:
 						// Prefer entries with low usefulness
 						if (us[t][idx] == 0) {
 							tags[t][idx] = tg;
-							ctrs[t][idx] = taken ? 2 : 1; // weak toward outcome
+							ctrs[t][idx] = taken ? 0 : -1; // weak toward outcome (borderline)
 							us[t][idx] = 0;
 							++allocs;
 						}
@@ -228,21 +264,22 @@ public:
 					unsigned int idx = idx_calc(t, bi.address);
 					unsigned short tg = tag_calc(t, bi.address);
 					tags[t][idx] = tg;
-					ctrs[t][idx] = taken ? 2 : 1;
+					ctrs[t][idx] = taken ? 0 : -1;
 					us[t][idx] = 0;
 				}
 			}
 
-			// Update global history with conditional outcome
-			ghist = ((ghist << 1) | (taken ? 1ULL : 0ULL));
-			// keep at most 64 bits
-			// (mask unnecessary for 64-bit but keeps intent clear)
-			ghist &= 0xFFFFFFFFFFFFFFFFULL;
+			// Update circular history with conditional outcome
+			unsigned int idx = hpos >> 5;
+			unsigned int ofs = hpos & 31;
+			unsigned int m = 1U << ofs;
+			hbits[idx] = (hbits[idx] & ~m) | (taken ? m : 0U);
+			hpos = (hpos + 1) & (HLEN - 1);
 
 			// Occasionally age usefulness counters (cheap global decay)
 			if ((++tick & 0x3FFFF) == 0) { // every ~262k updates
 				for (int t = 0; t < NTABLES; ++t) {
-					for (unsigned int i = 0; i < (1U << TBL_BITS); ++i) {
+					for (unsigned int i = 0; i < tbl_size[t]; ++i) {
 						if (us[t][i] > 0) --us[t][i];
 					}
 				}
