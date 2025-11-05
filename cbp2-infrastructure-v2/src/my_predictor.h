@@ -13,8 +13,6 @@ public:
 	unsigned int idx[4];
 	// which table provided the prediction (-1 means base)
 	int provider;
-	// which table provided altpred (-1 means base)
-	int alt_provider;
 	// whether altpred was used
 	bool used_alt;
 };
@@ -94,7 +92,6 @@ public:
 		bi = b;
 		u.used_alt = false;	// altpred not used by default
 		u.provider = -1;	// base table used by default
-		u.alt_provider = -1; // base table used by default
 
 		if (b.br_flags & BR_CONDITIONAL) {
 			// Base predictor
@@ -133,7 +130,6 @@ public:
 					u.used_alt = false;
 				}
 				u.provider = provider;
-				u.alt_provider = alt_provider;
 			}
 
 			u.direction_prediction(final_pred);	// update prediction with final_pred
@@ -146,7 +142,7 @@ public:
 	}
 
 	void update (branch_update *u_in, bool taken, unsigned int target) {
-		(void)target;
+		(void)target; // not used ???
 		if (bi.br_flags & BR_CONDITIONAL) {
 			// cast back into my_update to access fields
 			my_update *mu = (my_update*)u_in;
@@ -155,32 +151,23 @@ public:
 			// Always decrement base predictor if not taken
 			else ctr_dec(base[mu->base_index]);
 
-			// Provider and altpred update
+			// Provider update
 			int provider = mu->provider;
-			int alt_provider = mu->alt_provider;
 			bool provider_pred = false;
-			bool alt_pred = false;
 			unsigned char *pctr = 0;
-			unsigned char *actr = 0;
-			if (alt_provider >= 0) {
-				actr = &ctrs[alt_provider][mu->idx[alt_provider]];
-				alt_pred = ctr_pred(*actr);
-			}
 			if (provider >= 0) {
 				// update provider counter
 				pctr = &ctrs[provider][mu->idx[provider]];
 				provider_pred = ctr_pred(*pctr);
 				if (taken) ctr_inc(*pctr); else ctr_dec(*pctr);
-				// Update usefulness if alternate disagreed (i.e., when used)
+				// Update usefulness if alternate disagreed
+				// altpred only used when different from provider
 				unsigned char &pu = us[provider][mu->idx[provider]];
 				if (mu->used_alt) {
-					// Reward provider if it would have been correct when overridden; otherwise penalize
-					if (provider_pred == taken) { if (pu < 3) ++pu; } else { if (pu > 0) --pu; }
-					// Also update alternate provider usefulness if it exists
-					if (alt_provider >= 0) {
-						unsigned char &au = us[alt_provider][mu->idx[alt_provider]];
-						if (alt_pred == taken) { if (au < 3) ++au; } else { if (au > 0) --au; }
-					}
+					// increment if provider would have helped
+					// decrement otherwise
+					if (provider_pred == taken) { if (pu < 3) ++pu; }
+					else { if (pu > 0) --pu; }
 				}
 			}
 
